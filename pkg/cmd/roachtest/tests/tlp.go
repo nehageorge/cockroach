@@ -14,6 +14,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"github.com/cockroachdb/cockroach/pkg/cmd/cmpconn"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/errors"
 )
 
 const statementTimeout = time.Minute
@@ -71,6 +71,12 @@ func runTLP(ctx context.Context, t test.Test, c cluster.Cluster) {
 		t.Fatalf("could not initialize libraries: %v", err)
 	}
 	c.Start(ctx)
+	firstNode := c.Node(1)
+	urls, err := c.ExternalPGUrl(ctx, firstNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstNodeUrl := urls[0]
 
 	setup := sqlsmith.Setups["rand-tables"](rnd)
 
@@ -124,7 +130,7 @@ func runTLP(ctx context.Context, t test.Test, c cluster.Cluster) {
 			continue
 		}
 
-		if err := runTLPQuery(conn, smither, logStmt); err != nil {
+		if err := runTLPQuery(smither, ctx, firstNodeUrl); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -158,7 +164,7 @@ func runMutationStatement(conn *gosql.DB, smither *sqlsmith.Smither, logStmt fun
 // resulting counts of the queries are compared in order to verify logical
 // correctness. See GenerateTLP for more information on TLP and the generated
 // queries.
-func runTLPQuery(conn *gosql.DB, smither *sqlsmith.Smither, logStmt func(string)) error {
+func runTLPQuery(smither *sqlsmith.Smither, ctx context.Context, firstNodeUrl string) error {
 	// Ignore panics from GenerateTLP.
 	defer func() {
 		if r := recover(); r != nil {
@@ -169,30 +175,35 @@ func runTLPQuery(conn *gosql.DB, smither *sqlsmith.Smither, logStmt func(string)
 	unpartitioned, partitioned := smither.GenerateTLP()
 
 	return runWithTimeout(func() error {
-		var unpartitionedCount int
-		row := conn.QueryRow(unpartitioned)
-		if err := row.Scan(&unpartitionedCount); err != nil {
-			// Ignore errors.
-			//nolint:returnerrcheck
-			return nil
+		setStmtTimeout := fmt.Sprintf("SET statement_timeout='%s';", statementTimeout.String())
+		cmpConn1, err := cmpconn.NewConn(
+			ctx, firstNodeUrl, setStmtTimeout,
+		)
+		if err != nil {
+			return err
 		}
-
-		var partitionedCount int
-		row = conn.QueryRow(partitioned)
-		if err := row.Scan(&partitionedCount); err != nil {
-			// Ignore errors.
-			//nolint:returnerrcheck
-			return nil
+		cmpConn2, err := cmpconn.NewConn(
+			ctx, firstNodeUrl, setStmtTimeout,
+		)
+		if err != nil {
+			return err
 		}
-
-		if unpartitionedCount != partitionedCount {
-			logStmt(unpartitioned)
-			logStmt(partitioned)
-			return errors.Newf(
-				"expected unpartitioned count %d to equal partitioned count %d\nsql: %s\n%s",
-				unpartitionedCount, partitionedCount, unpartitioned, partitioned)
+		if _, err := cmpconn.CompareQueries(
+			ctx,
+			statementTimeout,
+			cmpConn1,
+			cmpConn2,
+			"",
+			partitioned,
+			unpartitioned,
+			true, /* ignoreSQLErrors */
+		); err != nil {
+			fmt.Println(partitioned)
+			fmt.Println(unpartitioned)
+			return err
 		}
-
+		defer cmpConn1.Close(ctx)
+		defer cmpConn2.Close(ctx)
 		return nil
 	})
 }

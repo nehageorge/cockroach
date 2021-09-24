@@ -213,6 +213,31 @@ func CompareConns(
 	return compareRows(connRows, ignoreSQLErrors)
 }
 
+func CompareQueries(
+	ctx context.Context,
+	timeout time.Duration,
+	conn1, conn2 Conn,
+	prep, partitioned, unpartitioned string,
+	ignoredSQLErrors bool,
+) (ignoredErr bool, err error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	connRows := make(map[string]pgx.Rows)
+	rows1, err := conn1.Values(ctx, prep, unpartitioned)
+	if err != nil {
+		return true, nil //nolint:returnerrcheck
+	}
+	defer rows1.Close()
+	connRows["unpartitioned"] = rows1
+	rows2, err := conn2.Values(ctx, prep, partitioned)
+	if err != nil {
+		return true, nil //nolint:returnerrcheck
+	}
+	defer rows2.Close()
+	connRows["partitioned"] = rows2
+	return compareRows(connRows, ignoredSQLErrors)
+}
+
 // compareRows compares the results of executing of queries on all connections.
 // It always returns an error if there are any differences. Additionally,
 // ignoreSQLErrors specifies whether SQL errors should be ignored (in which
@@ -229,12 +254,15 @@ ReadRows:
 		first = nil
 		firstName = ""
 		for name, rows := range connRows {
+			fmt.Println("Name: ", name)
 			if !rows.Next() {
 				minCount = rowCounts[name]
 				break ReadRows
 			}
 			rowCounts[name]++
 			vals, err := rows.Values()
+			fmt.Println("Values")
+			fmt.Printf("%v\n", vals)
 			if err != nil {
 				if ignoreSQLErrors {
 					// This function can fail if, for example,
